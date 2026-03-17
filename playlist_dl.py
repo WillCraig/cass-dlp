@@ -47,6 +47,7 @@ BATCH_PAUSE_MIN = 300   # 5 minutes
 BATCH_PAUSE_MAX = 600   # 10 minutes
 MAX_RETRIES = 5
 BACKOFF_BASE = 2
+INITIAL_DOWNLOAD_GUESS = 30  # seconds per song before real data
 
 VIDEO_ID_RE = re.compile(r"\[([A-Za-z0-9_-]{11})\]\.[a-z0-9]+$")
 
@@ -69,6 +70,42 @@ def colored(text: str, color: str) -> str:
     if not _supports_color():
         return text
     return f"{color}{text}{_Color.RESET}"
+
+# ── Time Estimation ──────────────────────────────────────────────────────────
+
+def format_duration(total_seconds: float) -> str:
+    """Convert seconds to a human-readable string like '2h 15m' or '45m 30s'."""
+    secs = max(0, int(total_seconds))
+    if secs >= 3600:
+        h = secs // 3600
+        m = (secs % 3600) // 60
+        return f"{h}h {m:02d}m"
+    elif secs >= 60:
+        m = secs // 60
+        s = secs % 60
+        return f"{m}m {s:02d}s"
+    else:
+        return f"{secs}s"
+
+
+def estimate_total_time(
+    pending_count: int, sleep_min: int, sleep_max: int,
+    batch_size: int, avg_download: float = INITIAL_DOWNLOAD_GUESS,
+) -> float:
+    """Estimate total seconds for pending downloads."""
+    avg_sleep = (sleep_min + sleep_max) / 2
+    avg_batch_pause = (BATCH_PAUSE_MIN + BATCH_PAUSE_MAX) / 2
+    num_batch_pauses = max(0, (pending_count - 1) // batch_size)
+    # Songs that trigger a batch pause don't also get the inter-download sleep
+    num_sleeps = max(0, pending_count - 1 - num_batch_pauses)
+
+    return (
+        pending_count * avg_download
+        + num_sleeps * avg_sleep
+        + num_batch_pauses * avg_batch_pause
+    )
+
+
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -169,7 +206,7 @@ def check_all_dependencies() -> None:
 
 # ── Banner ───────────────────────────────────────────────────────────────────
 
-def print_banner(args: argparse.Namespace) -> None:
+def print_banner(args: argparse.Namespace, pending_count: int = 0) -> None:
     print()
     print(colored("=" * 60, _Color.CYAN))
     print(colored(f"  playlist_dl v{VERSION} -- YouTube -> ALAC for iPod", _Color.BOLD))
@@ -189,6 +226,16 @@ def print_banner(args: argparse.Namespace) -> None:
     print(f"  JS runtime: {args.js_runtime}")
     print(f"  Dry run:    {args.dry_run}")
     print(f"  Resume:     {args.resume}")
+    if pending_count > 0 and not args.dry_run:
+        est = estimate_total_time(
+            pending_count, args.sleep_min, args.sleep_max, args.batch_size
+        )
+        print()
+        print(colored(
+            f"  Estimated time: ~{format_duration(est)} for {pending_count} song(s)"
+            f"  (refines as downloads progress)",
+            _Color.CYAN,
+        ))
     print()
 
 # ── Input Parsing ────────────────────────────────────────────────────────────
@@ -199,6 +246,7 @@ class DownloadTask:
     video_id: str
     index: int
     status: str = "pending"
+    download_seconds: float = 0.0
 
 
 def extract_video_id(url: str) -> str | None:
@@ -355,15 +403,18 @@ def execute_download(
             + (f" (attempt {attempt + 1}/{MAX_RETRIES})" if attempt > 0 else "")
         )
 
+        t_start = time.monotonic()
         result = subprocess.run(cmd, capture_output=True, text=True)
+        elapsed = time.monotonic() - t_start
 
         if result.returncode == 0:
+            task.download_seconds = elapsed
             title_line = ""
             for line in result.stdout.splitlines():
                 if "Destination:" in line or "[ExtractAudio]" in line:
                     title_line = line.strip()
                     break
-            logger.info(colored(f"  OK: {title_line or task.url}", _Color.GREEN))
+            logger.info(colored(f"  OK ({elapsed:.0f}s): {title_line or task.url}", _Color.GREEN))
             task.status = "downloaded"
             return True
 
@@ -439,6 +490,7 @@ def run_download_loop(
     output_dir = pathlib.Path(args.output_dir)
     batch_counter = 0
     batch_num = 1
+    download_times: list[float] = []
 
     # Update signal handler stats reference
     _interrupt_state["stats"] = stats
@@ -447,19 +499,39 @@ def run_download_loop(
         total=len(pending),
         desc="Downloading",
         unit="song",
-        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
     ) as pbar:
+        # Show initial ETA
+        initial_eta = estimate_total_time(
+            len(pending), args.sleep_min, args.sleep_max, args.batch_size
+        )
+        pbar.set_postfix_str(f"ETA: ~{format_duration(initial_eta)}")
+
         for i, task in enumerate(pending):
             success = execute_download(
                 task, output_dir, args.cookies, args.js_runtime, args.dry_run, logger
             )
             if success:
                 stats.downloaded += 1
+                if task.download_seconds > 0:
+                    download_times.append(task.download_seconds)
             else:
                 stats.failed += 1
 
             pbar.update(1)
             batch_counter += 1
+
+            # Update live ETA
+            remaining = len(pending) - i - 1
+            if remaining > 0:
+                avg_dl = sum(download_times) / len(download_times) if download_times else INITIAL_DOWNLOAD_GUESS
+                eta = estimate_total_time(
+                    remaining, args.sleep_min, args.sleep_max, args.batch_size,
+                    avg_download=avg_dl,
+                )
+                pbar.set_postfix_str(f"ETA: ~{format_duration(eta)}")
+            else:
+                pbar.set_postfix_str("Done!")
 
             is_last = i >= len(pending) - 1
 
@@ -548,7 +620,6 @@ def main(argv: list[str] | None = None) -> int:
     logger = setup_logging(output_dir / "download.log")
 
     check_all_dependencies()
-    print_banner(args)
 
     input_path = pathlib.Path(args.input)
     tasks = parse_input_file(input_path, logger)
@@ -561,6 +632,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.resume:
         existing_ids = scan_existing_downloads(output_dir)
         apply_resume(tasks, existing_ids, logger)
+
+    pending_count = sum(1 for t in tasks if t.status == "pending")
+    print_banner(args, pending_count)
 
     stats = DownloadStats(total=len(tasks))
     setup_signal_handler(stats, tasks, logger, args.input)
