@@ -40,14 +40,14 @@ except ImportError:
 VERSION = "1.0.0"
 DEFAULT_INPUT = "songs.txt"
 DEFAULT_OUTPUT_DIR = pathlib.Path.home() / "YouTubeMusicDownloads"
-DEFAULT_SLEEP_MIN = 20
-DEFAULT_SLEEP_MAX = 60
-DEFAULT_BATCH_SIZE = 50
-BATCH_PAUSE_MIN = 300   # 5 minutes
-BATCH_PAUSE_MAX = 600   # 10 minutes
+DEFAULT_SLEEP_MIN = 35
+DEFAULT_SLEEP_MAX = 95
+DEFAULT_BATCH_SIZE = 40      # ~40 songs/hour target
+BATCH_PAUSE_MIN = 300        # 5 minutes
+BATCH_PAUSE_MAX = 600        # 10 minutes
 MAX_RETRIES = 5
 BACKOFF_BASE = 2
-INITIAL_DOWNLOAD_GUESS = 30  # seconds per song before real data
+INITIAL_DOWNLOAD_GUESS = 25  # ~7 min song at 500K + ALAC conversion
 
 VIDEO_ID_RE = re.compile(r"\[([A-Za-z0-9_-]{11})\]\.[a-z0-9]+$")
 
@@ -158,12 +158,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--sleep-max", type=int, default=DEFAULT_SLEEP_MAX,
                    help=f"Max seconds between downloads (default: {DEFAULT_SLEEP_MAX})")
     p.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
-                   help=f"Downloads per batch before VPN pause (default: {DEFAULT_BATCH_SIZE})")
+                   help=f"Downloads per batch before VPN rotation pause (default: {DEFAULT_BATCH_SIZE})")
     p.add_argument("--cookies", choices=["safari", "chrome", "firefox", "none"],
                    default="none",
                    help="Browser to extract cookies from (default: none)")
     p.add_argument("--js-runtime", default="deno",
                    help="JS runtime for yt-dlp (default: deno)")
+    p.add_argument("--max-downloads", type=int, default=0,
+                   help="Stop after N downloads (0 = unlimited, default: 0)")
     p.add_argument("--dry-run", action="store_true",
                    help="Print yt-dlp commands without executing")
     p.add_argument("--resume", action="store_true", default=True,
@@ -177,6 +179,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         p.error("--sleep-min must be <= --sleep-max")
     if args.batch_size < 1:
         p.error("--batch-size must be >= 1")
+    if args.max_downloads < 0:
+        p.error("--max-downloads must be >= 0")
     if not pathlib.Path(args.input).is_file():
         p.error(f"Input file not found: {args.input}")
 
@@ -221,18 +225,20 @@ def print_banner(args: argparse.Namespace, pending_count: int = 0) -> None:
     print(f"  Input:      {args.input}")
     print(f"  Output:     {args.output_dir}")
     print(f"  Batch size: {args.batch_size}")
+    print(f"  Max DLs:    {args.max_downloads or 'unlimited'}")
     print(f"  Sleep:      {args.sleep_min}-{args.sleep_max}s")
     print(f"  Cookies:    {args.cookies}")
     print(f"  JS runtime: {args.js_runtime}")
     print(f"  Dry run:    {args.dry_run}")
     print(f"  Resume:     {args.resume}")
     if pending_count > 0 and not args.dry_run:
+        effective = min(pending_count, args.max_downloads) if args.max_downloads > 0 else pending_count
         est = estimate_total_time(
-            pending_count, args.sleep_min, args.sleep_max, args.batch_size
+            effective, args.sleep_min, args.sleep_max, args.batch_size
         )
         print()
         print(colored(
-            f"  Estimated time: ~{format_duration(est)} for {pending_count} song(s)"
+            f"  Estimated time: ~{format_duration(est)} for {effective} song(s)"
             f"  (refines as downloads progress)",
             _Color.CYAN,
         ))
@@ -482,6 +488,12 @@ def run_download_loop(
 
     pending = [t for t in tasks if t.status == "pending"]
     stats.skipped = len(tasks) - len(pending)
+
+    # Apply --max-downloads limit
+    max_dl = args.max_downloads
+    if max_dl > 0 and len(pending) > max_dl:
+        logger.info(f"Limiting to {max_dl} downloads (--max-downloads)")
+        pending = pending[:max_dl]
 
     if not pending:
         logger.info("All URLs already downloaded -- nothing to do.")
