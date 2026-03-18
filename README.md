@@ -1,10 +1,10 @@
 # playlist_dl
 
-Batch YouTube-to-ALAC downloader built for iPod. Downloads the highest-quality audio stream from YouTube and converts it to Apple Lossless (ALAC) `.m4a` — the best lossless-compatible format for iPod Classic, Nano, and the macOS Music app.
+ytdlp wrapper to space out downloads. perfect output for an ipod classic.
 
 ## Why ALAC?
 
-YouTube audio tops out at ~160-256 kbps (Opus/AAC). ALAC wraps that without any further quality loss, and iPods play it natively. FLAC sounds the same but iPod doesn't support it.
+For the ipod
 
 ## Setup
 
@@ -44,7 +44,7 @@ Empty lines and `#` comments are ignored. Playlist URLs are automatically expand
 python3 playlist_dl.py
 ```
 
-Reads `songs.txt`, downloads to `~/YouTubeMusicDownloads/`, sleeps 35-95s between songs, pauses every 40 for VPN rotation. Targets ~40 downloads/hour.
+Reads `songs.txt`, downloads to `~/YouTubeMusicDownloads/`, sleeps 35-95s between songs. Targets ~40 downloads/hour.
 
 ### Download a set number and pick up tomorrow
 
@@ -128,21 +128,6 @@ The script shows an estimated completion time before starting, and a live ETA th
 | 40 | ~1 hour |
 | 300 | ~8 hours |
 | 1,300 | ~36 hours |
-
-## Anti-Ban Strategy
-
-- **ProtonVPN**: Connect before running. The script pauses between batches and prompts you to switch servers.
-- **Random delays**: 35-95s between each download (configurable).
-- **Batch pauses**: 5-10 minute enforced pause every 40 songs.
-- **Retries**: Up to 5 attempts per song with exponential backoff.
-- **Rate limiting**: Bandwidth capped at 500 KB/s.
-- **Sequential only**: No parallel downloads.
-
-## Syncing to iPod
-
-1. Open **Music** app (macOS) → File → Add Folder to Library → select your output folder
-2. Create a playlist, drag the ALAC files in
-3. Connect iPod → Sync the playlist
 
 ## Ctrl+C
 
