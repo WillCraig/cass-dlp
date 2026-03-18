@@ -246,12 +246,21 @@ def print_banner(args: argparse.Namespace, pending_count: int = 0) -> None:
 
 # ── Input Parsing ────────────────────────────────────────────────────────────
 
+AGE_RESTRICT_PATTERNS = (
+    "Sign in to confirm your age",
+    "age-restricted",
+    "age_restricted",
+    "This video may be inappropriate for some users",
+    "confirm your age",
+)
+
+
 @dataclass
 class DownloadTask:
     url: str
     video_id: str
     index: int
-    status: str = "pending"
+    status: str = "pending"  # pending | skipped | downloaded | failed | age_restricted
     download_seconds: float = 0.0
 
 
@@ -424,9 +433,20 @@ def execute_download(
             task.status = "downloaded"
             return True
 
-        stderr_snippet = (result.stderr or "").strip().splitlines()
-        last_lines = "\n    ".join(stderr_snippet[-3:]) if stderr_snippet else "(no stderr)"
+        stderr_text = (result.stderr or "").strip()
+        stderr_lines = stderr_text.splitlines()
+        last_lines = "\n    ".join(stderr_lines[-3:]) if stderr_lines else "(no stderr)"
         logger.warning(f"  Failed (rc={result.returncode}):\n    {last_lines}")
+
+        # Detect age-restricted videos — no point retrying without cookies
+        if any(pat in stderr_text for pat in AGE_RESTRICT_PATTERNS):
+            task.status = "age_restricted"
+            logger.warning(colored(
+                f"  AGE-RESTRICTED: {task.url}\n"
+                f"    Skipping retries. Rerun with --cookies to download.",
+                _Color.YELLOW,
+            ))
+            return False
 
         if attempt < MAX_RETRIES - 1:
             backoff = (BACKOFF_BASE ** (attempt + 1)) + random.uniform(0, 5)
@@ -449,6 +469,20 @@ def write_failed_file(
         for url in failed_urls:
             f.write(url + "\n")
     logger.info(f"Failed URLs saved to: {failed_file}")
+
+
+def write_age_restricted_file(
+    tasks: list[DownloadTask], ar_file: pathlib.Path, logger: logging.Logger
+) -> None:
+    ar_urls = [t.url for t in tasks if t.status == "age_restricted"]
+    if not ar_urls:
+        return
+    with open(ar_file, "w", encoding="utf-8") as f:
+        f.write("# Age-restricted videos — rerun with --cookies to download:\n")
+        f.write("# python3 playlist_dl.py --input age_restricted.txt --cookies safari\n\n")
+        for url in ar_urls:
+            f.write(url + "\n")
+    logger.info(f"Age-restricted URLs saved to: {ar_file}")
 
 # ── Batch Pause ──────────────────────────────────────────────────────────────
 
@@ -475,6 +509,7 @@ class DownloadStats:
     downloaded: int = 0
     skipped: int = 0
     failed: int = 0
+    age_restricted: int = 0
     total: int = 0
 
 # ── Main Download Loop ──────────────────────────────────────────────────────
@@ -527,6 +562,8 @@ def run_download_loop(
                 stats.downloaded += 1
                 if task.download_seconds > 0:
                     download_times.append(task.download_seconds)
+            elif task.status == "age_restricted":
+                stats.age_restricted += 1
             else:
                 stats.failed += 1
 
@@ -565,17 +602,25 @@ def print_summary(stats: DownloadStats, logger: logging.Logger) -> None:
     print(colored("=" * 60, _Color.CYAN))
     print(colored("  Download Summary", _Color.BOLD))
     print(colored("=" * 60, _Color.CYAN))
-    print(colored(f"  Downloaded: {stats.downloaded}", _Color.GREEN))
-    print(colored(f"  Skipped:    {stats.skipped}", _Color.YELLOW))
-    print(colored(f"  Failed:     {stats.failed}", _Color.RED))
-    print(f"  Total:      {stats.total}")
+    print(colored(f"  Downloaded:      {stats.downloaded}", _Color.GREEN))
+    print(colored(f"  Skipped:         {stats.skipped}", _Color.YELLOW))
+    print(colored(f"  Age-restricted:  {stats.age_restricted}", _Color.YELLOW))
+    print(colored(f"  Failed:          {stats.failed}", _Color.RED))
+    print(f"  Total:           {stats.total}")
     print()
+    if stats.age_restricted > 0:
+        print(colored(
+            "  To download age-restricted videos:\n"
+            "    python3 playlist_dl.py --input age_restricted.txt --cookies safari",
+            _Color.YELLOW,
+        ))
     if stats.failed > 0:
         print(colored(
             "  To retry failed downloads:\n"
             "    python3 playlist_dl.py --input failed.txt",
             _Color.YELLOW,
         ))
+    if stats.age_restricted > 0 or stats.failed > 0:
         print()
 
 # ── Signal Handling ──────────────────────────────────────────────────────────
@@ -599,8 +644,9 @@ def _signal_handler(signum: int, frame) -> None:
     if logger:
         input_path = _interrupt_state.get("input_path")
         if input_path:
-            failed_file = pathlib.Path(input_path).parent / "failed.txt"
-            write_failed_file(tasks, failed_file, logger)
+            parent = pathlib.Path(input_path).parent
+            write_failed_file(tasks, parent / "failed.txt", logger)
+            write_age_restricted_file(tasks, parent / "age_restricted.txt", logger)
 
     if stats and logger:
         print_summary(stats, logger)
@@ -657,6 +703,9 @@ def main(argv: list[str] | None = None) -> int:
 
     failed_file = input_path.parent / "failed.txt"
     write_failed_file(tasks, failed_file, logger)
+
+    ar_file = input_path.parent / "age_restricted.txt"
+    write_age_restricted_file(tasks, ar_file, logger)
 
     print_summary(stats, logger)
     return 1 if stats.failed > 0 else 0
