@@ -157,8 +157,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help=f"Min seconds between downloads (default: {DEFAULT_SLEEP_MIN})")
     p.add_argument("--sleep-max", type=int, default=DEFAULT_SLEEP_MAX,
                    help=f"Max seconds between downloads (default: {DEFAULT_SLEEP_MAX})")
+    p.add_argument("--batch-pause", action="store_true", default=False,
+                   help="Pause every --batch-size downloads for VPN rotation (off by default)")
     p.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
-                   help=f"Downloads per batch before VPN rotation pause (default: {DEFAULT_BATCH_SIZE})")
+                   help=f"Downloads per batch when --batch-pause is enabled (default: {DEFAULT_BATCH_SIZE})")
     p.add_argument("--cookies", choices=["safari", "chrome", "firefox", "none"],
                    default="none",
                    help="Browser to extract cookies from (default: none)")
@@ -224,7 +226,8 @@ def print_banner(args: argparse.Namespace, pending_count: int = 0) -> None:
     print()
     print(f"  Input:      {args.input}")
     print(f"  Output:     {args.output_dir}")
-    print(f"  Batch size: {args.batch_size}")
+    if args.batch_pause:
+        print(f"  Batch size: {args.batch_size} (pause enabled)")
     print(f"  Max DLs:    {args.max_downloads or 'unlimited'}")
     print(f"  Sleep:      {args.sleep_min}-{args.sleep_max}s")
     print(f"  Cookies:    {args.cookies}")
@@ -233,8 +236,9 @@ def print_banner(args: argparse.Namespace, pending_count: int = 0) -> None:
     print(f"  Resume:     {args.resume}")
     if pending_count > 0 and not args.dry_run:
         effective = min(pending_count, args.max_downloads) if args.max_downloads > 0 else pending_count
+        batch_sz = args.batch_size if args.batch_pause else effective + 1
         est = estimate_total_time(
-            effective, args.sleep_min, args.sleep_max, args.batch_size
+            effective, args.sleep_min, args.sleep_max, batch_sz
         )
         print()
         print(colored(
@@ -542,6 +546,9 @@ def run_download_loop(
     # Update signal handler stats reference
     _interrupt_state["stats"] = stats
 
+    # Use a large batch_size for estimation when pauses are disabled
+    est_batch = args.batch_size if args.batch_pause else len(pending) + 1
+
     with tqdm(
         total=len(pending),
         desc="Downloading",
@@ -550,7 +557,7 @@ def run_download_loop(
     ) as pbar:
         # Show initial ETA
         initial_eta = estimate_total_time(
-            len(pending), args.sleep_min, args.sleep_max, args.batch_size
+            len(pending), args.sleep_min, args.sleep_max, est_batch
         )
         pbar.set_postfix_str(f"ETA: ~{format_duration(initial_eta)}")
 
@@ -575,7 +582,7 @@ def run_download_loop(
             if remaining > 0:
                 avg_dl = sum(download_times) / len(download_times) if download_times else INITIAL_DOWNLOAD_GUESS
                 eta = estimate_total_time(
-                    remaining, args.sleep_min, args.sleep_max, args.batch_size,
+                    remaining, args.sleep_min, args.sleep_max, est_batch,
                     avg_download=avg_dl,
                 )
                 pbar.set_postfix_str(f"ETA: ~{format_duration(eta)}")
@@ -584,7 +591,7 @@ def run_download_loop(
 
             is_last = i >= len(pending) - 1
 
-            if batch_counter >= args.batch_size and not is_last:
+            if args.batch_pause and batch_counter >= args.batch_size and not is_last:
                 batch_pause(batch_num, logger)
                 batch_num += 1
                 batch_counter = 0
