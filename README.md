@@ -1,6 +1,6 @@
-# playlist_dl
+# cass-dlp
 
-ytdlp wrapper to space out downloads. perfect output for an ipod classic.
+ytdlp wrapper to space out downloads. perfect output for an ipod classic. for Cassie.
 
 ## Why ALAC?
 
