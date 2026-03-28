@@ -258,13 +258,42 @@ AGE_RESTRICT_PATTERNS = (
     "confirm your age",
 )
 
+IP_BLOCK_PATTERNS = (
+    "HTTP Error 429",
+    "Too Many Requests",
+    "Sign in to confirm you're not a bot",
+    "confirm you're not a bot",
+    "looks like you're not a human",
+    "unusual traffic",
+)
+
+COOKIES_REQUIRED_PATTERNS = (
+    "Sign in to access this video",
+    "This is a private video",
+    "Private video",
+    "Join this channel to get access",
+    "members-only",
+    "This video is only available to Music Premium members",
+    "requires authentication",
+)
+
+VIDEO_UNAVAILABLE_PATTERNS = (
+    "Video unavailable",
+    "This video is not available",
+    "This video has been removed",
+    "no longer available",
+    "has been removed by the user",
+    "was removed by YouTube",
+    "This video does not exist",
+)
+
 
 @dataclass
 class DownloadTask:
     url: str
     video_id: str
     index: int
-    status: str = "pending"  # pending | skipped | downloaded | failed | age_restricted
+    status: str = "pending"  # pending | skipped | downloaded | failed | age_restricted | needs_cookies | unavailable | ip_blocked
     download_seconds: float = 0.0
 
 
@@ -438,27 +467,72 @@ def execute_download(
             return True
 
         stderr_text = (result.stderr or "").strip()
-        stderr_lines = stderr_text.splitlines()
-        last_lines = "\n    ".join(stderr_lines[-3:]) if stderr_lines else "(no stderr)"
-        logger.warning(f"  Failed (rc={result.returncode}):\n    {last_lines}")
 
-        # Detect age-restricted videos — no point retrying without cookies
+        # ── Classify the failure in plain terms ──────────────────────────────
+
+        # Age-gated — no point retrying without cookies
         if any(pat in stderr_text for pat in AGE_RESTRICT_PATTERNS):
             task.status = "age_restricted"
             logger.warning(colored(
                 f"  AGE-RESTRICTED: {task.url}\n"
-                f"    Skipping retries. Rerun with --cookies to download.",
+                f"    YouTube requires age verification for this video.\n"
+                f"    Fix: rerun with --cookies safari (or chrome/firefox).",
                 _Color.YELLOW,
             ))
             return False
+
+        # Sign-in required (private, members-only, etc.) — no point retrying
+        if any(pat in stderr_text for pat in COOKIES_REQUIRED_PATTERNS):
+            task.status = "needs_cookies"
+            logger.warning(colored(
+                f"  SIGN-IN REQUIRED: {task.url}\n"
+                f"    This video is private, members-only, or requires a YouTube account.\n"
+                f"    Fix: rerun with --cookies safari (or chrome/firefox).",
+                _Color.YELLOW,
+            ))
+            return False
+
+        # Video deleted / taken down — no point retrying
+        if any(pat in stderr_text for pat in VIDEO_UNAVAILABLE_PATTERNS):
+            task.status = "unavailable"
+            logger.warning(colored(
+                f"  VIDEO UNAVAILABLE: {task.url}\n"
+                f"    This video has been deleted or removed from YouTube.",
+                _Color.YELLOW,
+            ))
+            return False
+
+        # IP rate-limit / bot detection — worth retrying after backoff
+        if any(pat in stderr_text for pat in IP_BLOCK_PATTERNS):
+            logger.warning(colored(
+                f"  RATE LIMITED / BOT DETECTED (attempt {attempt + 1}/{MAX_RETRIES}): {task.url}\n"
+                f"    YouTube blocked this request. Suggestions:\n"
+                f"      • Enable a VPN and retry.\n"
+                f"      • Pass --cookies safari (or chrome/firefox) to authenticate.\n"
+                f"      • Increase --sleep-min / --sleep-max to space requests further apart.",
+                _Color.YELLOW,
+            ))
+            if attempt == MAX_RETRIES - 1:
+                task.status = "ip_blocked"
+        else:
+            stderr_lines = stderr_text.splitlines()
+            last_lines = "\n    ".join(stderr_lines[-3:]) if stderr_lines else "(no stderr)"
+            logger.warning(f"  Failed (rc={result.returncode}):\n    {last_lines}")
 
         if attempt < MAX_RETRIES - 1:
             backoff = (BACKOFF_BASE ** (attempt + 1)) + random.uniform(0, 5)
             logger.info(f"  Retrying in {backoff:.0f}s...")
             time.sleep(backoff)
 
-    task.status = "failed"
-    logger.error(colored(f"  FAILED after {MAX_RETRIES} attempts: {task.url}", _Color.RED))
+    if task.status == "ip_blocked":
+        logger.error(colored(
+            f"  IP BLOCKED after {MAX_RETRIES} attempts: {task.url}\n"
+            f"    Enable a VPN and retry: python3 playlist_dl.py --input failed.txt",
+            _Color.RED,
+        ))
+    else:
+        task.status = "failed"
+        logger.error(colored(f"  FAILED after {MAX_RETRIES} attempts: {task.url}", _Color.RED))
     return False
 
 # ── Failed URL File ──────────────────────────────────────────────────────────
@@ -466,7 +540,7 @@ def execute_download(
 def write_failed_file(
     tasks: list[DownloadTask], failed_file: pathlib.Path, logger: logging.Logger
 ) -> None:
-    failed_urls = [t.url for t in tasks if t.status == "failed"]
+    failed_urls = [t.url for t in tasks if t.status in ("failed", "ip_blocked")]
     if not failed_urls:
         return
     with open(failed_file, "w", encoding="utf-8") as f:
@@ -478,15 +552,15 @@ def write_failed_file(
 def write_age_restricted_file(
     tasks: list[DownloadTask], ar_file: pathlib.Path, logger: logging.Logger
 ) -> None:
-    ar_urls = [t.url for t in tasks if t.status == "age_restricted"]
+    ar_urls = [t.url for t in tasks if t.status in ("age_restricted", "needs_cookies")]
     if not ar_urls:
         return
     with open(ar_file, "w", encoding="utf-8") as f:
-        f.write("# Age-restricted videos — rerun with --cookies to download:\n")
+        f.write("# Videos that need browser cookies to download (age-restricted, private, or members-only):\n")
         f.write("# python3 playlist_dl.py --input age_restricted.txt --cookies safari\n\n")
         for url in ar_urls:
             f.write(url + "\n")
-    logger.info(f"Age-restricted URLs saved to: {ar_file}")
+    logger.info(f"Cookies-required URLs saved to: {ar_file}")
 
 # ── Batch Pause ──────────────────────────────────────────────────────────────
 
@@ -514,6 +588,9 @@ class DownloadStats:
     skipped: int = 0
     failed: int = 0
     age_restricted: int = 0
+    needs_cookies: int = 0
+    unavailable: int = 0
+    ip_blocked: int = 0
     total: int = 0
 
 # ── Main Download Loop ──────────────────────────────────────────────────────
@@ -571,6 +648,12 @@ def run_download_loop(
                     download_times.append(task.download_seconds)
             elif task.status == "age_restricted":
                 stats.age_restricted += 1
+            elif task.status == "needs_cookies":
+                stats.needs_cookies += 1
+            elif task.status == "unavailable":
+                stats.unavailable += 1
+            elif task.status == "ip_blocked":
+                stats.ip_blocked += 1
             else:
                 stats.failed += 1
 
@@ -612,14 +695,27 @@ def print_summary(stats: DownloadStats, logger: logging.Logger) -> None:
     print(colored(f"  Downloaded:      {stats.downloaded}", _Color.GREEN))
     print(colored(f"  Skipped:         {stats.skipped}", _Color.YELLOW))
     print(colored(f"  Age-restricted:  {stats.age_restricted}", _Color.YELLOW))
+    if stats.needs_cookies > 0:
+        print(colored(f"  Needs sign-in:   {stats.needs_cookies}", _Color.YELLOW))
+    if stats.unavailable > 0:
+        print(colored(f"  Unavailable:     {stats.unavailable}", _Color.YELLOW))
+    if stats.ip_blocked > 0:
+        print(colored(f"  IP blocked:      {stats.ip_blocked}", _Color.RED))
     print(colored(f"  Failed:          {stats.failed}", _Color.RED))
     print(f"  Total:           {stats.total}")
     print()
-    if stats.age_restricted > 0:
+    cookies_needed = stats.age_restricted + stats.needs_cookies
+    if cookies_needed > 0:
         print(colored(
-            "  To download age-restricted videos:\n"
+            "  To download age-restricted / sign-in-required videos:\n"
             "    python3 playlist_dl.py --input age_restricted.txt --cookies safari",
             _Color.YELLOW,
+        ))
+    if stats.ip_blocked > 0:
+        print(colored(
+            "  To retry IP-blocked downloads (enable a VPN first):\n"
+            "    python3 playlist_dl.py --input failed.txt",
+            _Color.RED,
         ))
     if stats.failed > 0:
         print(colored(
@@ -627,7 +723,7 @@ def print_summary(stats: DownloadStats, logger: logging.Logger) -> None:
             "    python3 playlist_dl.py --input failed.txt",
             _Color.YELLOW,
         ))
-    if stats.age_restricted > 0 or stats.failed > 0:
+    if cookies_needed > 0 or stats.failed > 0 or stats.ip_blocked > 0:
         print()
 
 # ── Signal Handling ──────────────────────────────────────────────────────────
@@ -715,7 +811,7 @@ def main(argv: list[str] | None = None) -> int:
     write_age_restricted_file(tasks, ar_file, logger)
 
     print_summary(stats, logger)
-    return 1 if stats.failed > 0 else 0
+    return 1 if (stats.failed > 0 or stats.ip_blocked > 0) else 0
 
 
 if __name__ == "__main__":
